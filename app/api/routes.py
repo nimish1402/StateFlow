@@ -2,10 +2,11 @@
 FastAPI routes for workflow graph management and execution.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, BackgroundTasks
 from sqlalchemy.orm import Session
 from typing import List
 import json
+from datetime import datetime
 
 from app.database import get_db
 from app.models import (
@@ -310,6 +311,61 @@ def run_graph(run_request: RunRequest, db: Session = Depends(get_db)):
         db.commit()
         
         raise HTTPException(status_code=500, detail=f"Workflow execution failed: {str(e)}")
+
+
+@router.post("/graph/run/async")
+async def run_graph_async(
+    run_request: RunRequest,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db)
+):
+    """
+    Execute a workflow asynchronously in the background.
+    
+    Returns immediately with run_id. Use GET /graph/state/{run_id}
+    to check progress and results.
+    
+    Args:
+        run_request: Run request with graph ID and initial state
+        background_tasks: FastAPI background tasks
+        db: Database session
+        
+    Returns:
+        Run ID and pending status
+    """
+    # Get graph
+    graph = db.query(Graph).filter(Graph.id == run_request.graph_id).first()
+    
+    if not graph:
+        raise HTTPException(status_code=404, detail=f"Graph '{run_request.graph_id}' not found")
+    
+    # Create workflow run with pending status
+    workflow_run = WorkflowRun(
+        graph_id=graph.id,
+        status=RunStatus.PENDING,
+        current_state=json.dumps(run_request.initial_state)
+    )
+    db.add(workflow_run)
+    db.commit()
+    db.refresh(workflow_run)
+    
+    # Add to background tasks
+    from app.api.background import execute_workflow_background
+    background_tasks.add_task(
+        execute_workflow_background,
+        workflow_run.id,
+        run_request.graph_id,
+        run_request.initial_state
+    )
+    
+    return {
+        "run_id": workflow_run.id,
+        "graph_id": workflow_run.graph_id,
+        "status": "pending",
+        "message": "Workflow execution started in background. Use GET /graph/state/{run_id} to check progress."
+    }
+
+
 
 
 @router.get("/graph/state/{run_id}", response_model=StateResponse)
