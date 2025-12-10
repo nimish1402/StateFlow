@@ -6,6 +6,7 @@ Handles sequential execution, branching, and looping.
 
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+import asyncio
 from app.engine.graph import WorkflowGraph
 from app.engine.state import WorkflowState
 
@@ -49,19 +50,37 @@ class WorkflowExecutor:
     - Conditional branching
     - Loop detection and execution
     - Execution logging
+    - WebSocket streaming (optional)
     """
     
-    def __init__(self, graph: WorkflowGraph, max_steps: int = 100):
+    def __init__(self, graph: WorkflowGraph, max_steps: int = 100, run_id: Optional[str] = None):
         """
         Initialize executor.
         
         Args:
             graph: Workflow graph to execute
             max_steps: Maximum number of steps to prevent infinite loops
+            run_id: Optional run ID for WebSocket streaming
         """
         self.graph = graph
         self.max_steps = max_steps
         self.execution_log: List[ExecutionStep] = []
+        self.run_id = run_id
+    
+    async def _stream_log(self, message: dict):
+        """
+        Stream log message via WebSocket if run_id is set.
+        
+        Args:
+            message: Log message dictionary
+        """
+        if self.run_id:
+            try:
+                from app.api.websocket import manager
+                await manager.send_log(self.run_id, message)
+            except Exception:
+                # Silently fail if streaming not available
+                pass
     
     def execute(self, initial_state: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -115,6 +134,41 @@ class WorkflowExecutor:
                 )
                 self.execution_log.append(step)
                 
+                # Stream log via WebSocket if run_id is set
+                if self.run_id:
+                    try:
+                        loop = asyncio.get_event_loop()
+                        if loop.is_running():
+                            # Create task in existing loop
+                            asyncio.create_task(self._stream_log({
+                                "type": "step_complete",
+                                "step_number": step_number,
+                                "node_name": current_node_name,
+                                "state_after": state_after,
+                                "message": f"Completed step {step_number}: {current_node_name}"
+                            }))
+                        else:
+                            # Run in new loop
+                            loop.run_until_complete(self._stream_log({
+                                "type": "step_complete",
+                                "step_number": step_number,
+                                "node_name": current_node_name,
+                                "state_after": state_after,
+                                "message": f"Completed step {step_number}: {current_node_name}"
+                            }))
+                    except RuntimeError:
+                        # No event loop, try creating one
+                        try:
+                            asyncio.run(self._stream_log({
+                                "type": "step_complete",
+                                "step_number": step_number,
+                                "node_name": current_node_name,
+                                "state_after": state_after,
+                                "message": f"Completed step {step_number}: {current_node_name}"
+                            }))
+                        except:
+                            pass  # Skip streaming if async not available
+                
                 # Get next node
                 current_node_name = self.graph.get_next_node(current_node_name, state)
                 
@@ -129,11 +183,36 @@ class WorkflowExecutor:
                 )
                 self.execution_log.append(step)
                 
+                # Stream error if WebSocket connected
+                if self.run_id:
+                    try:
+                        asyncio.run(self._stream_log({
+                            "type": "error",
+                            "step_number": step_number,
+                            "node_name": current_node_name,
+                            "error": str(e),
+                            "message": f"Error in step {step_number}: {str(e)}"
+                        }))
+                    except:
+                        pass
+                
                 raise ValueError(f"Error executing node '{current_node_name}': {str(e)}")
         
         # Check if we hit max steps (possible infinite loop)
         if step_number >= self.max_steps:
             raise ValueError(f"Workflow exceeded maximum steps ({self.max_steps}). Possible infinite loop.")
+        
+        # Stream completion message
+        if self.run_id:
+            try:
+                asyncio.run(self._stream_log({
+                    "type": "workflow_complete",
+                    "steps_executed": step_number,
+                    "final_state": state.to_dict(),
+                    "message": f"Workflow completed successfully in {step_number} steps"
+                }))
+            except:
+                pass
         
         return {
             "final_state": state.to_dict(),

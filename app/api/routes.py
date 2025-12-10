@@ -2,7 +2,7 @@
 FastAPI routes for workflow graph management and execution.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy.orm import Session
 from typing import List
 import json
@@ -25,8 +25,43 @@ from app.models import (
 )
 from app.engine import WorkflowGraph, FunctionNode, WorkflowExecutor
 from app.tools.registry import ToolRegistry
+from app.api.websocket import manager
 
 router = APIRouter()
+
+
+@router.websocket("/ws/run/{run_id}")
+async def websocket_endpoint(websocket: WebSocket, run_id: str):
+    """
+    WebSocket endpoint for streaming real-time execution logs.
+    
+    Connect to this endpoint before or during workflow execution
+    to receive live updates as each node completes.
+    
+    Args:
+        websocket: WebSocket connection
+        run_id: Workflow run ID to stream logs for
+        
+    Message Format:
+        {
+            "type": "connected" | "step_complete" | "workflow_complete" | "error",
+            "step_number": int,
+            "node_name": str,
+            "state_after": dict,
+            "message": str
+        }
+    """
+    await manager.connect(run_id, websocket)
+    try:
+        # Keep connection alive and listen for client messages
+        while True:
+            # Receive text to keep connection open
+            # Client can send "ping" to check connection
+            data = await websocket.receive_text()
+            if data == "ping":
+                await websocket.send_json({"type": "pong"})
+    except WebSocketDisconnect:
+        manager.disconnect(run_id, websocket)
 
 
 @router.post("/graph/create", response_model=GraphResponse, status_code=201)
@@ -218,8 +253,8 @@ def run_graph(run_request: RunRequest, db: Session = Depends(get_db)):
         # Build workflow graph
         wf_graph = build_workflow_graph(graph)
         
-        # Execute workflow
-        executor = WorkflowExecutor(wf_graph, max_steps=100)
+        # Execute workflow with run_id for WebSocket streaming
+        executor = WorkflowExecutor(wf_graph, max_steps=100, run_id=workflow_run.id)
         result = executor.execute(run_request.initial_state)
         
         # Update run status
